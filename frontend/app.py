@@ -1124,13 +1124,21 @@ class MainScreen(Screen):
             self.notify("Brak sal w systemie!", severity="error")
             return
 
-        def handle_result(result: bool) -> None:
-            if result:
+        def handle_result(result) -> None:
+            if result == True:
                 self.notify("Rezerwacja utworzona!", severity="information")
-                asyncio.create_task(self.refresh_all_data())
+            elif result == "waitlist":
+                self.notify("Dodano do kolejki!", severity="information")
+            # Odśwież dane w osobnym tasku
+            if result:
+                self.call_later(self._do_refresh)
 
         modal = NewReservationModal(self.client, self.app.user, self.rooms)
         self.app.push_screen(modal, handle_result)
+
+    def _do_refresh(self) -> None:
+        """Helper do odświeżania danych."""
+        self.call_later(self._do_refresh)
 
     @on(Button.Pressed, "#refresh-btn")
     async def action_refresh(self) -> None:
@@ -1147,7 +1155,7 @@ class MainScreen(Screen):
         def handle_result(result: bool) -> None:
             if result:
                 self.notify("Sala dodana!", severity="information")
-                asyncio.create_task(self.refresh_all_data())
+                self.call_later(self._do_refresh)
 
         self.app.push_screen(AddRoomModal(self.client), handle_result)
 
@@ -1168,7 +1176,7 @@ class MainScreen(Screen):
         def handle_result(result: bool) -> None:
             if result:
                 self.notify("Użytkownik dodany!", severity="information")
-                asyncio.create_task(self.refresh_all_data())
+                self.call_later(self._do_refresh)
 
         self.app.push_screen(AddUserModal(self.client), handle_result)
 
@@ -1233,7 +1241,7 @@ class MainScreen(Screen):
         def handle_result(result) -> None:
             if result:
                 self.notify(f"Rezerwacja {result}!", severity="information")
-                asyncio.create_task(self.refresh_all_data())
+                self.call_later(self._do_refresh)
 
         modal = EditReservationModal(self.client, self.app.user, reservation)
         self.app.push_screen(modal, handle_result)
@@ -1269,7 +1277,7 @@ class MainScreen(Screen):
         def handle_result(result) -> None:
             if result:
                 self.notify(f"Rezerwacja {result}!", severity="information")
-                asyncio.create_task(self.refresh_all_data())
+                self.call_later(self._do_refresh)
 
         modal = EditReservationModal(self.client, self.app.user, reservation)
         self.app.push_screen(modal, handle_result)
