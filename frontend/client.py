@@ -175,3 +175,29 @@ class ReservationClient:
             "password": password,
             "is_admin": is_admin
         })
+
+    # ============ KOLEJKA OCZEKUJĄCYCH ============
+
+    async def add_to_waitlist(self, room_id: int, user_id: int, date: str,
+                               start_time: str, end_time: str, description: str = "") -> dict:
+        """Dodaje do kolejki oczekujących."""
+        return await self.request("add_to_waitlist", {
+            "room_id": room_id,
+            "user_id": user_id,
+            "date": date,
+            "start_time": start_time,
+            "end_time": end_time,
+            "description": description
+        })
+
+    async def get_user_waitlist(self, user_id: int) -> dict:
+        """Pobiera pozycje w kolejce dla użytkownika."""
+        return await self.request("get_user_waitlist", {"user_id": user_id})
+
+    async def remove_from_waitlist(self, waitlist_id: int, user_id: int, is_admin: bool) -> dict:
+        """Usuwa pozycję z kolejki."""
+        return await self.request("remove_from_waitlist", {
+            "waitlist_id": waitlist_id,
+            "user_id": user_id,
+            "is_admin": is_admin
+        })

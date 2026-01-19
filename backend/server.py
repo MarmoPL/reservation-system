@@ -112,14 +112,58 @@ async def handle_message(websocket, message: dict) -> dict:
         return {"success": success, "message": msg}
 
     if action == "delete_reservation":
-        success, msg = db.delete_reservation(
+        success, msg, promoted = db.delete_reservation(
             data["reservation_id"],
             data["user_id"],
             data.get("is_admin", False)
         )
         if success:
             await broadcast({"type": "reservation_deleted"})
+            # Jeśli ktoś awansował z kolejki, powiadom
+            if promoted:
+                await broadcast({
+                    "type": "waitlist_promoted",
+                    "user_id": promoted["user_id"],
+                    "reservation": promoted
+                })
         return {"success": success, "message": msg}
+
+    # ============ KOLEJKA OCZEKUJĄCYCH ============
+    if action == "add_to_waitlist":
+        success, msg, position = db.add_to_waitlist(
+            data["room_id"],
+            data["user_id"],
+            data["date"],
+            data["start_time"],
+            data["end_time"],
+            data.get("description", "")
+        )
+        if success:
+            await broadcast({"type": "waitlist_updated"})
+        return {"success": success, "message": msg, "position": position}
+
+    if action == "get_user_waitlist":
+        waitlist = db.get_user_waitlist(data["user_id"])
+        return {"success": True, "waitlist": waitlist}
+
+    if action == "remove_from_waitlist":
+        success, msg = db.remove_from_waitlist(
+            data["waitlist_id"],
+            data["user_id"],
+            data.get("is_admin", False)
+        )
+        if success:
+            await broadcast({"type": "waitlist_updated"})
+        return {"success": success, "message": msg}
+
+    if action == "get_waitlist_count":
+        count = db.get_waitlist_count(
+            data["room_id"],
+            data["date"],
+            data["start_time"],
+            data["end_time"]
+        )
+        return {"success": True, "count": count}
 
     # ============ ADMIN - UŻYTKOWNICY ============
     if action == "get_all_users":

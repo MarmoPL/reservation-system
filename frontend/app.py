@@ -250,7 +250,8 @@ class NewReservationModal(ModalScreen):
             ),
             Horizontal(
                 Button("Utwórz", variant="success", id="create-btn"),
-                Button("Anuluj", variant="error", id="cancel-btn"),
+                Button("Do kolejki", variant="warning", id="waitlist-btn"),
+                Button("Anuluj", variant="default", id="cancel-btn"),
                 id="modal-buttons"
             ),
             id="modal-container"
@@ -258,25 +259,63 @@ class NewReservationModal(ModalScreen):
 
     @on(Button.Pressed, "#create-btn")
     async def create_reservation(self) -> None:
-        room_id = self.query_one("#room-select", Select).value
+        await self._try_create_or_waitlist(add_to_waitlist=False)
+
+    @on(Button.Pressed, "#waitlist-btn")
+    async def add_to_waitlist(self) -> None:
+        await self._try_create_or_waitlist(add_to_waitlist=True)
+
+    async def _try_create_or_waitlist(self, add_to_waitlist: bool) -> None:
+        room_select = self.query_one("#room-select", Select)
+        room_id = room_select.value
+
+        # Sprawdź czy wybrano salę
+        if room_id is Select.BLANK or room_id is None:
+            self.notify("Wybierz salę!", severity="error")
+            return
+
         date_str = self.query_one("#date-input", Input).value
         start_time = self.query_one("#start-input", Input).value
         end_time = self.query_one("#end-input", Input).value
         description = self.query_one("#desc-input", Input).value
 
-        result = await self.client.create_reservation(
-            room_id=room_id,
-            user_id=self.user["id"],
-            date=date_str,
-            start_time=start_time,
-            end_time=end_time,
-            description=description
-        )
+        # Walidacja pól
+        if not date_str or not start_time or not end_time:
+            self.notify("Wypełnij wszystkie wymagane pola!", severity="error")
+            return
 
-        if result["success"]:
-            self.dismiss(True)
+        if add_to_waitlist:
+            # Dodaj do kolejki
+            result = await self.client.add_to_waitlist(
+                room_id=int(room_id),
+                user_id=self.user["id"],
+                date=date_str,
+                start_time=start_time,
+                end_time=end_time,
+                description=description
+            )
+            if result["success"]:
+                self.dismiss("waitlist")
+            else:
+                self.notify(result.get("message", "Błąd"), severity="error")
         else:
-            self.notify(result.get("message", "Błąd"), severity="error")
+            # Spróbuj utworzyć rezerwację
+            result = await self.client.create_reservation(
+                room_id=int(room_id),
+                user_id=self.user["id"],
+                date=date_str,
+                start_time=start_time,
+                end_time=end_time,
+                description=description
+            )
+
+            if result["success"]:
+                self.dismiss(True)
+            elif "Konflikt" in result.get("message", ""):
+                # Pokaż przycisk kolejki
+                self.notify("Termin zajęty! Użyj 'Dołącz do kolejki'", severity="warning")
+            else:
+                self.notify(result.get("message", "Błąd"), severity="error")
 
     @on(Button.Pressed, "#cancel-btn")
     def action_cancel(self) -> None:
@@ -770,6 +809,7 @@ class MainScreen(Screen):
         self.current_week_start = date.today() - timedelta(days=date.today().weekday())
         self.my_reservations = []
         self.all_reservations = []
+        self.my_waitlist = []
 
     def compose(self) -> ComposeResult:
         user = self.app.user
@@ -795,10 +835,22 @@ class MainScreen(Screen):
                 )
 
             with TabPane("Moje rezerwacje", id="tab-my"):
-                yield DataTable(id="my-reservations-table")
+                yield Horizontal(
+                    Button("Edytuj zaznaczoną", variant="warning", id="edit-my-reservation-btn"),
+                    Button("Usuń zaznaczoną", variant="error", id="delete-my-reservation-btn"),
+                    id="my-reservations-header"
+                )
+                yield DataTable(id="my-reservations-table", cursor_type="row")
 
             with TabPane("Sale", id="tab-rooms"):
                 yield DataTable(id="rooms-table")
+
+            with TabPane("Moja kolejka", id="tab-waitlist"):
+                yield Horizontal(
+                    Button("Usuń z kolejki", variant="error", id="remove-waitlist-btn"),
+                    id="waitlist-header"
+                )
+                yield DataTable(id="waitlist-table", cursor_type="row")
 
             if user["is_admin"]:
                 with TabPane("Użytkownicy", id="tab-users"):
@@ -810,7 +862,12 @@ class MainScreen(Screen):
                     yield DataTable(id="users-table")
 
                 with TabPane("Wszystkie rezerwacje", id="tab-all"):
-                    yield DataTable(id="all-reservations-table")
+                    yield Horizontal(
+                        Button("Edytuj zaznaczoną", variant="warning", id="edit-all-reservation-btn"),
+                        Button("Usuń zaznaczoną", variant="error", id="delete-all-reservation-btn"),
+                        id="all-reservations-header"
+                    )
+                    yield DataTable(id="all-reservations-table", cursor_type="row")
 
                 with TabPane("Zarządzaj salami", id="tab-manage-rooms"):
                     yield Horizontal(
@@ -829,7 +886,21 @@ class MainScreen(Screen):
 
     async def handle_server_update(self, data: dict) -> None:
         """Obsługuje aktualizacje od serwera."""
-        self.notify("Dane zaktualizowane!", severity="information")
+        update_type = data.get("type", "")
+
+        # Powiadomienie o promocji z kolejki
+        if update_type == "waitlist_promoted":
+            if data.get("user_id") == self.app.user["id"]:
+                res = data.get("reservation", {})
+                self.notify(
+                    f"Awansowales z kolejki! Rezerwacja {res.get('room_name', '')} "
+                    f"na {res.get('date', '')}",
+                    severity="information",
+                    timeout=10
+                )
+        else:
+            self.notify("Dane zaktualizowane", timeout=2)
+
         await self.refresh_all_data()
 
     async def refresh_all_data(self) -> None:
@@ -842,6 +913,7 @@ class MainScreen(Screen):
         await self.update_calendar()
         await self.update_rooms_table()
         await self.update_my_reservations()
+        await self.update_waitlist_table()
 
         if self.app.user["is_admin"]:
             await self.update_users_table()
@@ -941,6 +1013,32 @@ class MainScreen(Screen):
                 f"{r['start_time'][:5]} - {r['end_time'][:5]}",
                 r.get("description", "")[:30],
                 key=str(r["id"])
+            )
+
+    async def update_waitlist_table(self) -> None:
+        """Aktualizuje tabelę kolejki oczekujących."""
+        result = await self.client.get_user_waitlist(self.app.user["id"])
+        self.my_waitlist = result.get("waitlist", [])
+
+        table = self.query_one("#waitlist-table", DataTable)
+        table.clear(columns=True)
+
+        table.add_column("ID", key="id")
+        table.add_column("Sala", key="room")
+        table.add_column("Data", key="date")
+        table.add_column("Godziny", key="time")
+        table.add_column("Pozycja", key="position")
+        table.add_column("Opis", key="description")
+
+        for w in self.my_waitlist:
+            table.add_row(
+                str(w["id"]),
+                w["room_name"],
+                w["date"],
+                f"{w['start_time'][:5]} - {w['end_time'][:5]}",
+                str(w["position"]),
+                w.get("description", "")[:20],
+                key=str(w["id"])
             )
 
     async def update_users_table(self) -> None:
@@ -1088,35 +1186,123 @@ class MainScreen(Screen):
                 else:
                     self.notify(result.get("message", "Błąd"), severity="error")
 
+    @on(Button.Pressed, "#remove-waitlist-btn")
+    async def remove_from_waitlist(self) -> None:
+        """Usuwa zaznaczoną pozycję z kolejki."""
+        table = self.query_one("#waitlist-table", DataTable)
+        if table.cursor_row is not None and self.my_waitlist:
+            if table.cursor_row < len(self.my_waitlist):
+                waitlist_entry = self.my_waitlist[table.cursor_row]
+                result = await self.client.remove_from_waitlist(
+                    waitlist_id=waitlist_entry["id"],
+                    user_id=self.app.user["id"],
+                    is_admin=self.app.user.get("is_admin", False)
+                )
+                if result["success"]:
+                    self.notify("Usunięto z kolejki!", severity="warning")
+                    await self.refresh_all_data()
+                else:
+                    self.notify(result.get("message", "Błąd"), severity="error")
+        else:
+            self.notify("Zaznacz pozycję do usunięcia!", severity="warning")
+
+    def _get_selected_my_reservation(self):
+        """Pobiera zaznaczoną rezerwację z tabeli 'Moje rezerwacje'."""
+        table = self.query_one("#my-reservations-table", DataTable)
+        if table.cursor_row is not None and self.my_reservations:
+            if table.cursor_row < len(self.my_reservations):
+                return self.my_reservations[table.cursor_row]
+        return None
+
+    def _get_selected_all_reservation(self):
+        """Pobiera zaznaczoną rezerwację z tabeli 'Wszystkie rezerwacje'."""
+        table = self.query_one("#all-reservations-table", DataTable)
+        if table.cursor_row is not None and self.all_reservations:
+            if table.cursor_row < len(self.all_reservations):
+                return self.all_reservations[table.cursor_row]
+        return None
+
+    @on(Button.Pressed, "#edit-my-reservation-btn")
+    async def edit_my_reservation(self) -> None:
+        """Edytuje zaznaczoną rezerwację użytkownika."""
+        reservation = self._get_selected_my_reservation()
+        if not reservation:
+            self.notify("Zaznacz rezerwację do edycji!", severity="warning")
+            return
+
+        def handle_result(result) -> None:
+            if result:
+                self.notify(f"Rezerwacja {result}!", severity="information")
+                asyncio.create_task(self.refresh_all_data())
+
+        modal = EditReservationModal(self.client, self.app.user, reservation)
+        self.app.push_screen(modal, handle_result)
+
+    @on(Button.Pressed, "#delete-my-reservation-btn")
+    async def delete_my_reservation(self) -> None:
+        """Usuwa zaznaczoną rezerwację użytkownika."""
+        reservation = self._get_selected_my_reservation()
+        if not reservation:
+            self.notify("Zaznacz rezerwację do usunięcia!", severity="warning")
+            return
+
+        result = await self.client.delete_reservation(
+            reservation_id=reservation["id"],
+            user_id=self.app.user["id"],
+            is_admin=self.app.user.get("is_admin", False)
+        )
+
+        if result["success"]:
+            self.notify("Rezerwacja usunięta!", severity="warning")
+            await self.refresh_all_data()
+        else:
+            self.notify(result.get("message", "Błąd"), severity="error")
+
+    @on(Button.Pressed, "#edit-all-reservation-btn")
+    async def edit_all_reservation(self) -> None:
+        """Admin edytuje zaznaczoną rezerwację."""
+        reservation = self._get_selected_all_reservation()
+        if not reservation:
+            self.notify("Zaznacz rezerwację do edycji!", severity="warning")
+            return
+
+        def handle_result(result) -> None:
+            if result:
+                self.notify(f"Rezerwacja {result}!", severity="information")
+                asyncio.create_task(self.refresh_all_data())
+
+        modal = EditReservationModal(self.client, self.app.user, reservation)
+        self.app.push_screen(modal, handle_result)
+
+    @on(Button.Pressed, "#delete-all-reservation-btn")
+    async def delete_all_reservation(self) -> None:
+        """Admin usuwa zaznaczoną rezerwację."""
+        reservation = self._get_selected_all_reservation()
+        if not reservation:
+            self.notify("Zaznacz rezerwację do usunięcia!", severity="warning")
+            return
+
+        result = await self.client.delete_reservation(
+            reservation_id=reservation["id"],
+            user_id=self.app.user["id"],
+            is_admin=True
+        )
+
+        if result["success"]:
+            self.notify("Rezerwacja usunięta!", severity="warning")
+            await self.refresh_all_data()
+        else:
+            self.notify(result.get("message", "Błąd"), severity="error")
+
     @on(DataTable.RowSelected, "#my-reservations-table")
     async def on_my_reservation_selected(self, event: DataTable.RowSelected) -> None:
-        """Otwiera modal edycji po wybraniu rezerwacji."""
-        if event.row_key:
-            res_id = int(str(event.row_key.value))
-            reservation = next((r for r in self.my_reservations if r["id"] == res_id), None)
-            if reservation:
-                def handle_result(result) -> None:
-                    if result:
-                        self.notify(f"Rezerwacja {result}!", severity="information")
-                        asyncio.create_task(self.refresh_all_data())
-
-                modal = EditReservationModal(self.client, self.app.user, reservation)
-                self.app.push_screen(modal, handle_result)
+        """Otwiera modal edycji po wybraniu rezerwacji (Enter)."""
+        await self.edit_my_reservation()
 
     @on(DataTable.RowSelected, "#all-reservations-table")
     async def on_all_reservation_selected(self, event: DataTable.RowSelected) -> None:
-        """Admin może edytować dowolną rezerwację."""
-        if event.row_key:
-            res_id = int(str(event.row_key.value))
-            reservation = next((r for r in self.all_reservations if r["id"] == res_id), None)
-            if reservation:
-                def handle_result(result) -> None:
-                    if result:
-                        self.notify(f"Rezerwacja {result}!", severity="information")
-                        asyncio.create_task(self.refresh_all_data())
-
-                modal = EditReservationModal(self.client, self.app.user, reservation)
-                self.app.push_screen(modal, handle_result)
+        """Admin może edytować dowolną rezerwację (Enter)."""
+        await self.edit_all_reservation()
 
 
 # ============================================================================
@@ -1153,7 +1339,7 @@ class ReservationApp(App):
 
     def action_toggle_dark(self) -> None:
         """Przełącza tryb ciemny/jasny."""
-        self.dark = not self.dark
+        self.theme = "textual-light" if self.theme == "textual-dark" else "textual-dark"
 
 
 async def main():

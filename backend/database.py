@@ -67,6 +67,23 @@ def init_database():
             )
         """)
 
+        # Tabela kolejki oczekujących (waitlist)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS waitlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (room_id) REFERENCES rooms(id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
         # Dodaj domyślnego admina jeśli nie istnieje
         cursor.execute("SELECT id FROM users WHERE username = 'admin'")
         if not cursor.fetchone():
@@ -314,23 +331,39 @@ def update_reservation(reservation_id: int, user_id: int, is_admin: bool,
         return True, "Rezerwacja zaktualizowana"
 
 
-def delete_reservation(reservation_id: int, user_id: int, is_admin: bool) -> tuple[bool, str]:
-    """Usuwa rezerwację (właściciel lub admin)."""
+def delete_reservation(reservation_id: int, user_id: int, is_admin: bool) -> tuple[bool, str, Optional[dict]]:
+    """
+    Usuwa rezerwację (właściciel lub admin).
+    Automatycznie promuje pierwszą osobę z kolejki.
+    Zwraca (sukces, komunikat, promowana_rezerwacja lub None).
+    """
     with get_connection() as conn:
         cursor = conn.cursor()
 
-        # Sprawdź uprawnienia
-        cursor.execute("SELECT user_id FROM reservations WHERE id = ?", (reservation_id,))
+        # Pobierz pełne dane rezerwacji
+        cursor.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,))
         reservation = cursor.fetchone()
 
         if not reservation:
-            return False, "Rezerwacja nie istnieje"
+            return False, "Rezerwacja nie istnieje", None
 
         if reservation["user_id"] != user_id and not is_admin:
-            return False, "Brak uprawnień do usunięcia tej rezerwacji"
+            return False, "Brak uprawnień do usunięcia tej rezerwacji", None
+
+        # Zapisz dane do promocji z kolejki
+        room_id = reservation["room_id"]
+        date_str = reservation["date"]
+        start_time = reservation["start_time"]
+        end_time = reservation["end_time"]
 
         cursor.execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
-        return True, "Rezerwacja usunięta"
+
+    # Promuj z kolejki (poza transakcją aby uniknąć locków)
+    promoted = promote_from_waitlist(room_id, date_str, start_time, end_time)
+
+    if promoted:
+        return True, f"Rezerwacja usunięta. {promoted['username']} awansował z kolejki!", promoted
+    return True, "Rezerwacja usunięta", None
 
 
 def archive_past_reservations():
@@ -358,3 +391,184 @@ def get_week_reservations(start_date: str, end_date: str) -> list[dict]:
             (start_date, end_date)
         )
         return [dict(row) for row in cursor.fetchall()]
+
+
+# ============ KOLEJKA OCZEKUJĄCYCH (WAITLIST) ============
+
+def add_to_waitlist(room_id: int, user_id: int, date_str: str,
+                    start_time: str, end_time: str, description: str = "") -> tuple[bool, str, int]:
+    """Dodaje do kolejki oczekujących. Zwraca (sukces, komunikat, pozycja)."""
+    # Walidacja czasu
+    if start_time >= end_time:
+        return False, "Godzina rozpoczęcia musi być przed godziną zakończenia", 0
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        # Sprawdź czy użytkownik już jest w kolejce na ten termin
+        cursor.execute(
+            """SELECT id FROM waitlist
+               WHERE room_id = ? AND user_id = ? AND date = ?
+               AND NOT (end_time <= ? OR start_time >= ?)""",
+            (room_id, user_id, date_str, start_time, end_time)
+        )
+        if cursor.fetchone():
+            return False, "Już jesteś w kolejce na ten termin", 0
+
+        # Sprawdź czy użytkownik nie ma już rezerwacji na ten termin
+        cursor.execute(
+            """SELECT id FROM reservations
+               WHERE room_id = ? AND user_id = ? AND date = ? AND is_archived = 0
+               AND NOT (end_time <= ? OR start_time >= ?)""",
+            (room_id, user_id, date_str, start_time, end_time)
+        )
+        if cursor.fetchone():
+            return False, "Masz już rezerwację na ten termin", 0
+
+        # Oblicz pozycję w kolejce (dla nakładających się terminów)
+        cursor.execute(
+            """SELECT MAX(position) FROM waitlist
+               WHERE room_id = ? AND date = ?
+               AND NOT (end_time <= ? OR start_time >= ?)""",
+            (room_id, date_str, start_time, end_time)
+        )
+        result = cursor.fetchone()
+        position = (result[0] or 0) + 1
+
+        cursor.execute(
+            """INSERT INTO waitlist
+               (room_id, user_id, date, start_time, end_time, description, position)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (room_id, user_id, date_str, start_time, end_time, description, position)
+        )
+        return True, f"Dodano do kolejki na pozycji {position}", position
+
+
+def get_waitlist_for_slot(room_id: int, date_str: str, start_time: str, end_time: str) -> list[dict]:
+    """Pobiera kolejkę oczekujących dla danego slotu czasowego."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT w.*, users.username, rooms.name as room_name
+               FROM waitlist w
+               JOIN users ON w.user_id = users.id
+               JOIN rooms ON w.room_id = rooms.id
+               WHERE w.room_id = ? AND w.date = ?
+               AND NOT (w.end_time <= ? OR w.start_time >= ?)
+               ORDER BY w.position""",
+            (room_id, date_str, start_time, end_time)
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_user_waitlist(user_id: int) -> list[dict]:
+    """Pobiera pozycje w kolejce dla użytkownika."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT w.*, rooms.name as room_name
+               FROM waitlist w
+               JOIN rooms ON w.room_id = rooms.id
+               WHERE w.user_id = ?
+               ORDER BY w.date, w.start_time""",
+            (user_id,)
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def remove_from_waitlist(waitlist_id: int, user_id: int, is_admin: bool) -> tuple[bool, str]:
+    """Usuwa pozycję z kolejki."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM waitlist WHERE id = ?", (waitlist_id,))
+        entry = cursor.fetchone()
+
+        if not entry:
+            return False, "Pozycja nie istnieje"
+
+        if entry["user_id"] != user_id and not is_admin:
+            return False, "Brak uprawnień"
+
+        cursor.execute("DELETE FROM waitlist WHERE id = ?", (waitlist_id,))
+        return True, "Usunięto z kolejki"
+
+
+def promote_from_waitlist(room_id: int, date_str: str, start_time: str, end_time: str) -> Optional[dict]:
+    """
+    Promuje pierwszą osobę z kolejki na rezerwację.
+    Wywoływane automatycznie po usunięciu rezerwacji.
+    Zwraca dane nowej rezerwacji lub None.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        # Znajdź pierwszą osobę w kolejce dla tego slotu
+        cursor.execute(
+            """SELECT * FROM waitlist
+               WHERE room_id = ? AND date = ?
+               AND NOT (end_time <= ? OR start_time >= ?)
+               ORDER BY position
+               LIMIT 1""",
+            (room_id, date_str, start_time, end_time)
+        )
+        entry = cursor.fetchone()
+
+        if not entry:
+            return None
+
+        # Sprawdź czy nie ma konfliktu (ktoś mógł zająć w międzyczasie)
+        cursor.execute(
+            """SELECT id FROM reservations
+               WHERE room_id = ? AND date = ? AND is_archived = 0
+               AND NOT (end_time <= ? OR start_time >= ?)""",
+            (room_id, date_str, entry["start_time"], entry["end_time"])
+        )
+        if cursor.fetchone():
+            return None  # Slot zajęty
+
+        # Utwórz rezerwację
+        cursor.execute(
+            """INSERT INTO reservations
+               (room_id, user_id, date, start_time, end_time, description)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (entry["room_id"], entry["user_id"], entry["date"],
+             entry["start_time"], entry["end_time"], entry["description"])
+        )
+        new_reservation_id = cursor.lastrowid
+
+        # Usuń z kolejki
+        cursor.execute("DELETE FROM waitlist WHERE id = ?", (entry["id"],))
+
+        # Zaktualizuj pozycje pozostałych w kolejce
+        cursor.execute(
+            """UPDATE waitlist SET position = position - 1
+               WHERE room_id = ? AND date = ?
+               AND NOT (end_time <= ? OR start_time >= ?)
+               AND position > ?""",
+            (room_id, date_str, start_time, end_time, entry["position"])
+        )
+
+        # Pobierz dane nowej rezerwacji
+        cursor.execute(
+            """SELECT r.*, rooms.name as room_name, users.username
+               FROM reservations r
+               JOIN rooms ON r.room_id = rooms.id
+               JOIN users ON r.user_id = users.id
+               WHERE r.id = ?""",
+            (new_reservation_id,)
+        )
+        return dict(cursor.fetchone())
+
+
+def get_waitlist_count(room_id: int, date_str: str, start_time: str, end_time: str) -> int:
+    """Zwraca liczbę osób w kolejce dla danego slotu."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT COUNT(*) FROM waitlist
+               WHERE room_id = ? AND date = ?
+               AND NOT (end_time <= ? OR start_time >= ?)""",
+            (room_id, date_str, start_time, end_time)
+        )
+        return cursor.fetchone()[0]
