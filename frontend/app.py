@@ -1138,7 +1138,7 @@ class MainScreen(Screen):
 
     def _do_refresh(self) -> None:
         """Helper do odświeżania danych."""
-        self.call_later(self._do_refresh)
+        asyncio.create_task(self.refresh_all_data())
 
     @on(Button.Pressed, "#refresh-btn")
     async def action_refresh(self) -> None:
